@@ -3,8 +3,19 @@ import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { ArSession } from "./xr/ArSession.js";
 import { HandTracker } from "./hands/HandTracker.js";
+import { RawCameraHandTracker } from "./hands/RawCameraHandTracker.js";
 import { SpraySystem, SPRAY_COLORS } from "./graffiti/SpraySystem.js";
 import { SoundManager } from "./audio/SoundManager.js";
+import { intersectRayPlane } from "./utils/rayPlane.js";
+
+// How many XR frames to wait for the WebXR "camera-access" module
+// (XRWebGLBinding.getCameraImage) to prove itself available before
+// giving up and falling back to front-camera hand-tracking. It's an
+// experimental, permission-gated feature, so this can't be known ahead
+// of a live session.
+const RAW_CAMERA_GRACE_FRAMES = 60;
+const HELD_CAN_HUD_POSITION = new THREE.Vector3(0.13, -0.14, -0.3);
+const PALM_CAN_DISTANCE = 0.35;
 
 const canvas = document.getElementById("app-canvas");
 const startScreen = document.getElementById("start-screen");
@@ -88,11 +99,23 @@ const soundManager = new SoundManager();
 let isPinching = false;
 let isTouching = false;
 let wasSpraying = false;
-let handTrackingAvailable = false;
 let hasPlayedFallbackRattle = false;
+
+// 'pending' (deciding), 'raw-camera' (rear-camera hand-tracking via
+// WebXR camera-access, palm-anchored), 'front-camera' (fallback:
+// front-camera gesture as a trigger only, position via screen-center
+// reticle), or 'touch-only' (no camera at all, tap-and-hold).
+let handTrackingMode = "pending";
+let rawCameraGraceFrames = 0;
+let rawCameraTracker = null;
+let startingFrontCameraFallback = false;
 
 function isSpraying() {
   return isPinching || isTouching;
+}
+
+function isHandTrackingActive() {
+  return handTrackingMode === "raw-camera" || handTrackingMode === "front-camera";
 }
 
 const handTracker = new HandTracker({
@@ -107,25 +130,56 @@ const handTracker = new HandTracker({
   },
 });
 
+async function startFrontCameraFallback() {
+  if (startingFrontCameraFallback) return;
+  startingFrontCameraFallback = true;
+  try {
+    await handTracker.start();
+    handTrackingMode = "front-camera";
+  } catch (err) {
+    console.warn("Front-camera hand-tracking unavailable, using tap-to-spray", err);
+    handTrackingMode = "touch-only";
+  }
+}
+
 const arSession = new ArSession({
   renderer,
   overlayRoot: xrOverlay,
-  onSessionStart: () => {
+  onSessionStart: (session) => {
     startScreen.style.display = "none";
     xrOverlay.classList.add("active");
     xrStatus.textContent = "Move phone to find a surface";
     if (heldCanGroup) heldCanGroup.visible = true;
+
+    handTrackingMode = "pending";
+    rawCameraGraceFrames = 0;
+    startingFrontCameraFallback = false;
+    rawCameraTracker = new RawCameraHandTracker({
+      renderer,
+      onPinchChange: (pinching) => {
+        isPinching = pinching;
+      },
+      onHandDetected: () => {
+        soundManager.playRattle();
+      },
+    });
+    rawCameraTracker.init(session);
   },
   onSessionEnd: () => {
     handTracker.stop();
+    rawCameraTracker?.dispose();
+    rawCameraTracker = null;
+    handTrackingMode = "pending";
     soundManager.stopHiss();
     isPinching = false;
     isTouching = false;
     wasSpraying = false;
-    handTrackingAvailable = false;
     hasPlayedFallbackRattle = false;
     reticle.visible = false;
-    if (heldCanGroup) heldCanGroup.visible = false;
+    if (heldCanGroup) {
+      heldCanGroup.visible = false;
+      heldCanGroup.position.copy(HELD_CAN_HUD_POSITION);
+    }
 
     startScreen.style.display = "flex";
     xrOverlay.classList.remove("active");
@@ -155,13 +209,11 @@ arButton.addEventListener("click", async () => {
     console.warn("Audio init failed, continuing without sound", err);
   }
 
-  try {
-    await handTracker.start();
-    handTrackingAvailable = true;
-  } catch (err) {
-    console.warn("Hand-tracking camera unavailable, using tap-to-spray", err);
-    handTrackingAvailable = false;
-  }
+  // Hand-tracking mode itself is decided once the session is live and
+  // we can tell whether WebXR camera-access actually activated (see
+  // onSessionStart / the animate loop's 'pending' branch) - starting
+  // the front-camera getUserMedia stream here, before that's known,
+  // would grab a camera we might not end up needing.
 
   if (previewGroup) scene.remove(previewGroup);
 
@@ -179,25 +231,61 @@ arButton.addEventListener("click", async () => {
 });
 
 const clock = new THREE.Clock();
+const _tmpViewMatrix = new THREE.Matrix4();
 
 function animate(_time, frame) {
   const dt = Math.min(clock.getDelta(), 0.1);
 
   if (frame) {
     arSession.update(frame);
-    reticle.visible = !!arSession.latestHit;
-    if (arSession.latestHit) {
-      reticle.position.copy(arSession.latestHit.position);
-      reticle.quaternion.copy(arSession.latestHit.quaternion);
+
+    const referenceSpace = renderer.xr.getReferenceSpace();
+    const viewerPose = referenceSpace ? frame.getViewerPose(referenceSpace) : null;
+    const xrView = viewerPose?.views[0] ?? null;
+
+    if (handTrackingMode === "pending" && xrView) {
+      rawCameraTracker?.processFrame(frame, xrView);
+      if (rawCameraTracker?.available) {
+        handTrackingMode = "raw-camera";
+      } else {
+        rawCameraGraceFrames++;
+        if (rawCameraGraceFrames > RAW_CAMERA_GRACE_FRAMES) {
+          startFrontCameraFallback();
+        }
+      }
+    } else if (handTrackingMode === "raw-camera" && xrView) {
+      rawCameraTracker?.processFrame(frame, xrView);
     }
 
-    const spraying = isSpraying() && !!arSession.latestHit;
+    // Paint position: when the palm is tracked directly in the AR
+    // camera feed, cast from it to the last known surface plane;
+    // otherwise fall back to the screen-center hit-test reticle.
+    let paintPose = arSession.latestHit;
+    if (handTrackingMode === "raw-camera" && rawCameraTracker?.palmRay && arSession.latestHit) {
+      const hitPoint = intersectRayPlane(
+        rawCameraTracker.palmRay.origin,
+        rawCameraTracker.palmRay.direction,
+        arSession.latestHit.position,
+        arSession.latestHit.normal,
+      );
+      if (hitPoint) {
+        paintPose = { position: hitPoint, quaternion: arSession.latestHit.quaternion };
+      }
+    }
+
+    reticle.visible = !!paintPose;
+    if (paintPose) {
+      reticle.position.copy(paintPose.position);
+      reticle.quaternion.copy(paintPose.quaternion);
+    }
+
+    const spraying = isSpraying() && !!paintPose;
     if (spraying && !wasSpraying) {
-      // Hand-tracked sessions cue the rattle off picking up the can /
-      // shaking it (see handTracker's onHandDetected/onShake); only the
-      // touch-only fallback (no camera) has no such signal, so give it
-      // a one-time rattle on its very first spray instead.
-      if (!handTrackingAvailable && !hasPlayedFallbackRattle) {
+      // Hand-tracked sessions (either mode) cue the rattle off picking
+      // up the can / shaking it; only the touch-only fallback (no
+      // camera at all) has no such signal, so give it a one-time
+      // rattle on its very first spray instead.
+      if (!isHandTrackingActive() && !hasPlayedFallbackRattle) {
         soundManager.playRattle();
         hasPlayedFallbackRattle = true;
       }
@@ -207,9 +295,19 @@ function animate(_time, frame) {
     }
     wasSpraying = spraying;
 
-    spraySystem.update(dt, arSession.latestHit, spraying);
+    spraySystem.update(dt, paintPose, spraying);
 
     if (heldCanGroup) {
+      if (handTrackingMode === "raw-camera" && rawCameraTracker?.palmRay && xrView) {
+        const worldPoint = rawCameraTracker.palmRay.origin
+          .clone()
+          .addScaledVector(rawCameraTracker.palmRay.direction, PALM_CAN_DISTANCE);
+        _tmpViewMatrix.fromArray(xrView.transform.matrix).invert();
+        heldCanGroup.position.copy(worldPoint.applyMatrix4(_tmpViewMatrix));
+      } else {
+        heldCanGroup.position.copy(HELD_CAN_HUD_POSITION);
+      }
+
       const targetTilt = spraying ? -0.3 : 0;
       heldCanGroup.rotation.x = THREE.MathUtils.lerp(
         heldCanGroup.rotation.x,
@@ -218,11 +316,13 @@ function animate(_time, frame) {
       );
     }
 
-    xrStatus.textContent = !arSession.latestHit
+    xrStatus.textContent = !paintPose
       ? "Move phone to find a surface"
       : spraying
         ? "Spraying…"
-        : "Pinch your free hand, or tap and hold, to spray";
+        : handTrackingMode === "raw-camera"
+          ? "Pinch to spray"
+          : "Pinch your free hand, or tap and hold, to spray";
   } else if (previewGroup) {
     previewGroup.rotation.y += dt * 0.6;
   }
@@ -292,7 +392,7 @@ async function loadHeldCan() {
 
   heldCanGroup = new THREE.Group();
   heldCanGroup.add(model);
-  heldCanGroup.position.set(0.13, -0.14, -0.3);
+  heldCanGroup.position.copy(HELD_CAN_HUD_POSITION);
   heldCanGroup.rotation.set(0, Math.PI * 0.15, Math.PI * 0.08);
   heldCanGroup.visible = false;
   camera.add(heldCanGroup);

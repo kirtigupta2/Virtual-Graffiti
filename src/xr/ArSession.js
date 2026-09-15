@@ -43,7 +43,11 @@ export class ArSession {
   async start() {
     const session = await navigator.xr.requestSession("immersive-ar", {
       requiredFeatures: ["hit-test", "local"],
-      optionalFeatures: ["dom-overlay"],
+      // camera-access is optional: an experimental, permission-gated
+      // module (shipped Chrome ~M107) not guaranteed on every browser,
+      // so we feature-detect per-frame (view.camera) rather than
+      // require it, and fall back to front-camera tracking if absent.
+      optionalFeatures: ["dom-overlay", "camera-access"],
       domOverlay: { root: this.overlayRoot },
     });
 
@@ -119,6 +123,10 @@ export class ArSession {
     const scale = new THREE.Vector3();
     m.decompose(position, quaternion, scale);
 
-    this.latestHit = { position, quaternion, matrix: m };
+    // The hit-test pose's local +Y axis is the surface normal (the
+    // standard WebXR reticle convention).
+    const normal = new THREE.Vector3(0, 1, 0).applyQuaternion(quaternion);
+
+    this.latestHit = { position, quaternion, matrix: m, normal };
   }
 }
