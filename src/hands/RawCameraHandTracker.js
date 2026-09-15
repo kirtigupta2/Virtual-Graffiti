@@ -53,6 +53,8 @@ export class RawCameraHandTracker {
     this.available = false;
     this.isPinching = false;
     this.lastPinchMetric = null;
+    /** Message from the last init/processFrame failure, for on-screen debugging. */
+    this.lastError = null;
 
     /** World-space ray through the tracked palm (landmark 9), or null. */
     this.palmRay = null;
@@ -115,6 +117,7 @@ export class RawCameraHandTracker {
     } catch (err) {
       console.warn("Raw camera access unavailable", err);
       this.available = false;
+      this.lastError = `${err.name}: ${err.message}`;
       return false;
     }
   }
@@ -123,6 +126,11 @@ export class RawCameraHandTracker {
   processFrame(frame, view) {
     if (!this.binding || !view.camera) {
       this.available = false;
+      if (!this.lastError) {
+        this.lastError = !this.binding
+          ? "XRWebGLBinding failed to construct"
+          : "view.camera absent (camera-access not granted/supported)";
+      }
       return;
     }
 
@@ -194,6 +202,7 @@ export class RawCameraHandTracker {
     } catch (err) {
       console.warn("Raw camera frame processing failed", err);
       this.available = false;
+      this.lastError = `${err.name}: ${err.message}`;
     }
   }
 

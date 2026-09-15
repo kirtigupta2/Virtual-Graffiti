@@ -109,7 +109,13 @@ let hasPlayedFallbackRattle = false;
 let handTrackingMode = "pending";
 let rawCameraGraceFrames = 0;
 let rawCameraTracker = null;
-let startingFrontCameraFallback = false;
+// Whether the front-facing getUserMedia stream + MediaPipe pipeline is
+// already running, acquired *before* the AR session starts (see the
+// ar-button handler): requesting it mid-session was unreliable, since
+// Chrome appears to restrict additional camera permission prompts
+// while an immersive-ar session is already presenting fullscreen.
+let frontCameraReady = false;
+let frontCameraError = null;
 
 function isSpraying() {
   return isPinching || isTouching;
@@ -131,18 +137,6 @@ const handTracker = new HandTracker({
   },
 });
 
-async function startFrontCameraFallback() {
-  if (startingFrontCameraFallback) return;
-  startingFrontCameraFallback = true;
-  try {
-    await handTracker.start();
-    handTrackingMode = "front-camera";
-  } catch (err) {
-    console.warn("Front-camera hand-tracking unavailable, using tap-to-spray", err);
-    handTrackingMode = "touch-only";
-  }
-}
-
 const arSession = new ArSession({
   renderer,
   overlayRoot: xrOverlay,
@@ -154,7 +148,6 @@ const arSession = new ArSession({
 
     handTrackingMode = "pending";
     rawCameraGraceFrames = 0;
-    startingFrontCameraFallback = false;
     rawCameraTracker = new RawCameraHandTracker({
       renderer,
       onPinchChange: (pinching) => {
@@ -168,6 +161,7 @@ const arSession = new ArSession({
   },
   onSessionEnd: () => {
     handTracker.stop();
+    frontCameraReady = false;
     rawCameraTracker?.dispose();
     rawCameraTracker = null;
     handTrackingMode = "pending";
@@ -210,11 +204,21 @@ arButton.addEventListener("click", async () => {
     console.warn("Audio init failed, continuing without sound", err);
   }
 
-  // Hand-tracking mode itself is decided once the session is live and
-  // we can tell whether WebXR camera-access actually activated (see
-  // onSessionStart / the animate loop's 'pending' branch) - starting
-  // the front-camera getUserMedia stream here, before that's known,
-  // would grab a camera we might not end up needing.
+  // Acquire the front-camera fallback *before* entering the AR session:
+  // requesting getUserMedia mid-session was unreliable (see the
+  // frontCameraReady comment above). Whether it actually gets used
+  // depends on whether WebXR camera-access proves out once the session
+  // starts (see onSessionStart / the animate loop's 'pending' branch);
+  // it just needs to already be running by then, not requested then.
+  try {
+    await handTracker.start();
+    frontCameraReady = true;
+    frontCameraError = null;
+  } catch (err) {
+    console.warn("Front-camera hand-tracking unavailable, using tap-to-spray", err);
+    frontCameraReady = false;
+    frontCameraError = `${err.name}: ${err.message}`;
+  }
 
   if (previewGroup) scene.remove(previewGroup);
 
@@ -251,7 +255,9 @@ function animate(_time, frame) {
       } else {
         rawCameraGraceFrames++;
         if (rawCameraGraceFrames > RAW_CAMERA_GRACE_FRAMES) {
-          startFrontCameraFallback();
+          // Already running (started before the session, see the
+          // ar-button handler) - just switch to using its signal.
+          handTrackingMode = frontCameraReady ? "front-camera" : "touch-only";
         }
       }
     } else if (handTrackingMode === "raw-camera" && xrView) {
@@ -326,11 +332,13 @@ function animate(_time, frame) {
           : "Pinch your free hand, or tap and hold, to spray";
 
     debugEl.textContent =
-      `mode=${handTrackingMode}\n` +
+      `mode=${handTrackingMode} frontReady=${frontCameraReady}\n` +
       `raw: available=${!!rawCameraTracker?.available} handPresent=${!!rawCameraTracker?.handPresent} ` +
       `pinch=${!!rawCameraTracker?.isPinching} metric=${rawCameraTracker?.lastPinchMetric?.toFixed(2) ?? "-"}\n` +
+      `rawErr=${rawCameraTracker?.lastError ?? "-"}\n` +
       `front: handPresent=${handTracker.handPresent} pinch=${handTracker.isPinching} ` +
       `metric=${handTracker.lastPinchMetric?.toFixed(2) ?? "-"}\n` +
+      `frontErr=${frontCameraError ?? "-"}\n` +
       `touching=${isTouching} hasHit=${!!arSession.latestHit}`;
   } else if (previewGroup) {
     previewGroup.rotation.y += dt * 0.6;
