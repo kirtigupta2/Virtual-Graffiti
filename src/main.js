@@ -23,6 +23,7 @@ const arButton = document.getElementById("ar-button");
 const unsupportedNote = document.getElementById("unsupported-note");
 const xrOverlay = document.getElementById("xr-overlay");
 const xrStatus = document.getElementById("xr-status");
+const debugEl = document.getElementById("debug-info");
 const xrExitButton = document.getElementById("xr-exit");
 const paletteEl = document.getElementById("palette");
 
@@ -323,6 +324,14 @@ function animate(_time, frame) {
         : handTrackingMode === "raw-camera"
           ? "Pinch to spray"
           : "Pinch your free hand, or tap and hold, to spray";
+
+    debugEl.textContent =
+      `mode=${handTrackingMode}\n` +
+      `raw: available=${!!rawCameraTracker?.available} handPresent=${!!rawCameraTracker?.handPresent} ` +
+      `pinch=${!!rawCameraTracker?.isPinching} metric=${rawCameraTracker?.lastPinchMetric?.toFixed(2) ?? "-"}\n` +
+      `front: handPresent=${handTracker.handPresent} pinch=${handTracker.isPinching} ` +
+      `metric=${handTracker.lastPinchMetric?.toFixed(2) ?? "-"}\n` +
+      `touching=${isTouching} hasHit=${!!arSession.latestHit}`;
   } else if (previewGroup) {
     previewGroup.rotation.y += dt * 0.6;
   }

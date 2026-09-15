@@ -3,6 +3,12 @@ import { Hands } from "@mediapipe/hands";
 
 const PINCH_ON_THRESHOLD = 0.35;
 const PINCH_OFF_THRESHOLD = 0.45;
+// See HandTracker.js for why these confirm-frame counts exist: single-
+// frame landmark jitter (more likely here given the downsampled,
+// throttled feed) would otherwise flip isPinching spuriously.
+const PINCH_ON_CONFIRM_FRAMES = 3;
+const PINCH_OFF_CONFIRM_FRAMES = 2;
+const HAND_LOST_CONFIRM_TICKS = 4; // processed ticks, not raw XR frames
 const PROCESS_EVERY_N_FRAMES = 3; // ~20fps at a 60Hz XR frame rate
 const DOWNSAMPLE_WIDTH = 256;
 const DOWNSAMPLE_HEIGHT = 192;
@@ -46,9 +52,14 @@ export class RawCameraHandTracker {
 
     this.available = false;
     this.isPinching = false;
+    this.lastPinchMetric = null;
 
     /** World-space ray through the tracked palm (landmark 9), or null. */
     this.palmRay = null;
+
+    this._missingTickCount = 0;
+    this._pinchOnStreak = 0;
+    this._pinchOffStreak = 0;
   }
 
   /** Call once after the XR session has started. Never throws. */
@@ -224,12 +235,16 @@ export class RawCameraHandTracker {
   _onResults(results) {
     const landmarks = results.multiHandLandmarks?.[0];
     if (!landmarks) {
-      this._setPinching(false);
-      this._lastPalmUV = null;
-      this.palmRay = null;
-      this.handPresent = false;
+      this._missingTickCount++;
+      if (this._missingTickCount >= HAND_LOST_CONFIRM_TICKS) {
+        this._setPinching(false);
+        this._lastPalmUV = null;
+        this.palmRay = null;
+        this.handPresent = false;
+      }
       return;
     }
+    this._missingTickCount = 0;
 
     if (!this.handPresent) {
       this.handPresent = true;
@@ -247,15 +262,20 @@ export class RawCameraHandTracker {
     const pinchDist = distance(thumbTip, indexTip);
     const handScale = distance(wrist, middleMcp) || 1;
     const normalized = pinchDist / handScale;
+    this.lastPinchMetric = normalized;
 
-    if (!this.isPinching && normalized < PINCH_ON_THRESHOLD) {
-      this._setPinching(true);
-    } else if (this.isPinching && normalized > PINCH_OFF_THRESHOLD) {
-      this._setPinching(false);
+    if (!this.isPinching) {
+      this._pinchOnStreak = normalized < PINCH_ON_THRESHOLD ? this._pinchOnStreak + 1 : 0;
+      if (this._pinchOnStreak >= PINCH_ON_CONFIRM_FRAMES) this._setPinching(true);
+    } else {
+      this._pinchOffStreak = normalized > PINCH_OFF_THRESHOLD ? this._pinchOffStreak + 1 : 0;
+      if (this._pinchOffStreak >= PINCH_OFF_CONFIRM_FRAMES) this._setPinching(false);
     }
   }
 
   _setPinching(value) {
+    this._pinchOnStreak = 0;
+    this._pinchOffStreak = 0;
     if (this.isPinching === value) return;
     this.isPinching = value;
     if (this.onPinchChange) this.onPinchChange(value);
@@ -275,6 +295,8 @@ export class RawCameraHandTracker {
     this.palmRay = null;
     this._lastPalmUV = null;
     this.handPresent = false;
+    this.lastPinchMetric = null;
+    this._missingTickCount = 0;
     this._setPinching(false);
   }
 }

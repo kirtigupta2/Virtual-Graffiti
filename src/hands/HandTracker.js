@@ -2,6 +2,17 @@ import { Hands } from "@mediapipe/hands";
 
 const PINCH_ON_THRESHOLD = 0.35;
 const PINCH_OFF_THRESHOLD = 0.45;
+// Require the pinch/release condition to hold for several consecutive
+// frames before acting on it - single-frame landmark jitter (common in
+// low light or at the low front-camera resolution used here) would
+// otherwise flip isPinching spuriously, causing unintended sprays.
+const PINCH_ON_CONFIRM_FRAMES = 3;
+const PINCH_OFF_CONFIRM_FRAMES = 2;
+// MediaPipe can drop the hand for a frame or two even while it's still
+// in view (motion blur, brief occlusion); requiring several consecutive
+// missed frames before treating it as truly gone avoids re-firing
+// onHandDetected (and its rattle) on every flicker.
+const HAND_LOST_CONFIRM_FRAMES = 8;
 
 // Wrist speed in normalized-frame-widths/second that counts as a
 // "shake" (rattling the can), and the minimum gap between triggers so
@@ -27,10 +38,15 @@ export class HandTracker {
     this.running = false;
     this.isPinching = false;
     this.handPresent = false;
+    /** Last computed normalized pinch distance, for on-screen debugging. */
+    this.lastPinchMetric = null;
 
     this._prevWrist = null;
     this._prevTime = null;
     this._lastShakeTime = 0;
+    this._missingFrameCount = 0;
+    this._pinchOnStreak = 0;
+    this._pinchOffStreak = 0;
   }
 
   static isSupported() {
@@ -81,12 +97,18 @@ export class HandTracker {
   _onResults(results) {
     const landmarks = results.multiHandLandmarks?.[0];
     if (!landmarks) {
-      this._setPinching(false);
-      this.handPresent = false;
-      this._prevWrist = null;
-      this._prevTime = null;
+      this._missingFrameCount++;
+      if (this._missingFrameCount >= HAND_LOST_CONFIRM_FRAMES) {
+        this._setPinching(false);
+        this.handPresent = false;
+        this._prevWrist = null;
+        this._prevTime = null;
+        this._pinchOnStreak = 0;
+        this._pinchOffStreak = 0;
+      }
       return;
     }
+    this._missingFrameCount = 0;
 
     if (!this.handPresent) {
       this.handPresent = true;
@@ -101,11 +123,14 @@ export class HandTracker {
     const pinchDist = distance(thumbTip, indexTip);
     const handScale = distance(wrist, middleMcp) || 1;
     const normalized = pinchDist / handScale;
+    this.lastPinchMetric = normalized;
 
-    if (!this.isPinching && normalized < PINCH_ON_THRESHOLD) {
-      this._setPinching(true);
-    } else if (this.isPinching && normalized > PINCH_OFF_THRESHOLD) {
-      this._setPinching(false);
+    if (!this.isPinching) {
+      this._pinchOnStreak = normalized < PINCH_ON_THRESHOLD ? this._pinchOnStreak + 1 : 0;
+      if (this._pinchOnStreak >= PINCH_ON_CONFIRM_FRAMES) this._setPinching(true);
+    } else {
+      this._pinchOffStreak = normalized > PINCH_OFF_THRESHOLD ? this._pinchOffStreak + 1 : 0;
+      if (this._pinchOffStreak >= PINCH_OFF_CONFIRM_FRAMES) this._setPinching(false);
     }
 
     this._trackShake(wrist);
@@ -136,6 +161,8 @@ export class HandTracker {
   }
 
   _setPinching(value) {
+    this._pinchOnStreak = 0;
+    this._pinchOffStreak = 0;
     if (this.isPinching === value) return;
     this.isPinching = value;
     if (this.onPinchChange) this.onPinchChange(value);
@@ -151,8 +178,10 @@ export class HandTracker {
     this.video = null;
     this.stream = null;
     this.handPresent = false;
+    this.lastPinchMetric = null;
     this._prevWrist = null;
     this._prevTime = null;
+    this._missingFrameCount = 0;
     this._setPinching(false);
   }
 }
