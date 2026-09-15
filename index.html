@@ -110,6 +110,32 @@
         color: #fff;
         font-size: 0.85rem;
       }
+
+      #palette {
+        position: absolute;
+        bottom: calc(env(safe-area-inset-bottom, 24px) + 68px);
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 14px;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.4);
+        pointer-events: auto;
+      }
+
+      .swatch {
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 255, 255, 0.5);
+        padding: 0;
+      }
+
+      .swatch.active {
+        border-color: #fff;
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.3);
+      }
     </style>
   </head>
   <body>
@@ -128,6 +154,7 @@
 
     <div id="xr-overlay">
       <div id="xr-status">Aim at a surface</div>
+      <div id="palette"></div>
       <button id="xr-exit">Exit AR</button>
     </div>
 

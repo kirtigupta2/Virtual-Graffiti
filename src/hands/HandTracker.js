@@ -3,6 +3,12 @@ import { Hands } from "@mediapipe/hands";
 const PINCH_ON_THRESHOLD = 0.35;
 const PINCH_OFF_THRESHOLD = 0.45;
 
+// Wrist speed in normalized-frame-widths/second that counts as a
+// "shake" (rattling the can), and the minimum gap between triggers so
+// one shaking motion doesn't fire a burst of overlapping rattles.
+const SHAKE_SPEED_THRESHOLD = 2.5;
+const SHAKE_DEBOUNCE_MS = 500;
+
 /**
  * Runs MediaPipe Hands (WASM) on the front-facing camera so the user's
  * free hand can pinch a "spray trigger" while the rear camera stays
@@ -10,13 +16,21 @@ const PINCH_OFF_THRESHOLD = 0.45;
  * phones can't serve the same physical camera to two consumers at once.
  */
 export class HandTracker {
-  constructor({ onPinchChange }) {
+  constructor({ onPinchChange, onHandDetected, onShake }) {
     this.onPinchChange = onPinchChange;
+    this.onHandDetected = onHandDetected;
+    this.onShake = onShake;
+
     this.video = null;
     this.stream = null;
     this.hands = null;
     this.running = false;
     this.isPinching = false;
+    this.handPresent = false;
+
+    this._prevWrist = null;
+    this._prevTime = null;
+    this._lastShakeTime = 0;
   }
 
   static isSupported() {
@@ -68,7 +82,15 @@ export class HandTracker {
     const landmarks = results.multiHandLandmarks?.[0];
     if (!landmarks) {
       this._setPinching(false);
+      this.handPresent = false;
+      this._prevWrist = null;
+      this._prevTime = null;
       return;
+    }
+
+    if (!this.handPresent) {
+      this.handPresent = true;
+      if (this.onHandDetected) this.onHandDetected();
     }
 
     const thumbTip = landmarks[4];
@@ -85,6 +107,32 @@ export class HandTracker {
     } else if (this.isPinching && normalized > PINCH_OFF_THRESHOLD) {
       this._setPinching(false);
     }
+
+    this._trackShake(wrist);
+  }
+
+  _trackShake(wrist) {
+    const now = performance.now();
+
+    if (this._prevWrist && this._prevTime) {
+      const dt = (now - this._prevTime) / 1000;
+      if (dt > 0) {
+        const dx = wrist.x - this._prevWrist.x;
+        const dy = wrist.y - this._prevWrist.y;
+        const speed = Math.sqrt(dx * dx + dy * dy) / dt;
+
+        if (
+          speed > SHAKE_SPEED_THRESHOLD &&
+          now - this._lastShakeTime > SHAKE_DEBOUNCE_MS
+        ) {
+          this._lastShakeTime = now;
+          if (this.onShake) this.onShake();
+        }
+      }
+    }
+
+    this._prevWrist = { x: wrist.x, y: wrist.y };
+    this._prevTime = now;
   }
 
   _setPinching(value) {
@@ -102,6 +150,9 @@ export class HandTracker {
     this.hands = null;
     this.video = null;
     this.stream = null;
+    this.handPresent = false;
+    this._prevWrist = null;
+    this._prevTime = null;
     this._setPinching(false);
   }
 }

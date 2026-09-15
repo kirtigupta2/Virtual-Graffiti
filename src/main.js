@@ -3,7 +3,7 @@ import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { ArSession } from "./xr/ArSession.js";
 import { HandTracker } from "./hands/HandTracker.js";
-import { SpraySystem } from "./graffiti/SpraySystem.js";
+import { SpraySystem, SPRAY_COLORS } from "./graffiti/SpraySystem.js";
 import { SoundManager } from "./audio/SoundManager.js";
 
 const canvas = document.getElementById("app-canvas");
@@ -13,6 +13,7 @@ const unsupportedNote = document.getElementById("unsupported-note");
 const xrOverlay = document.getElementById("xr-overlay");
 const xrStatus = document.getElementById("xr-status");
 const xrExitButton = document.getElementById("xr-exit");
+const paletteEl = document.getElementById("palette");
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -21,6 +22,11 @@ renderer.xr.enabled = true;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, 1, 0.01, 20);
+// Children of the camera (the held-can HUD prop) only render if the
+// camera itself is reachable from the scene graph the renderer
+// traverses - three.js's WebXR manager keeps this camera's matrixWorld
+// synced to the live XR pose each frame, so this is safe in-session too.
+scene.add(camera);
 
 // Mobile Chrome can report a 0 or stale window.innerHeight on the very
 // first synchronous tick (before the dynamic toolbar/layout settles),
@@ -57,6 +63,20 @@ reticle.visible = false;
 scene.add(reticle);
 
 let previewGroup = null;
+let heldCanGroup = null;
+
+for (let i = 0; i < SPRAY_COLORS.length; i++) {
+  const btn = document.createElement("button");
+  btn.className = "swatch";
+  if (i === 0) btn.classList.add("active");
+  btn.style.background = `#${SPRAY_COLORS[i].toString(16).padStart(6, "0")}`;
+  btn.addEventListener("click", () => {
+    spraySystem.setColorIndex(i);
+    for (const el of paletteEl.children) el.classList.remove("active");
+    btn.classList.add("active");
+  });
+  paletteEl.appendChild(btn);
+}
 
 window.addEventListener("resize", applyViewportSize);
 window.addEventListener("orientationchange", applyViewportSize);
@@ -68,6 +88,8 @@ const soundManager = new SoundManager();
 let isPinching = false;
 let isTouching = false;
 let wasSpraying = false;
+let handTrackingAvailable = false;
+let hasPlayedFallbackRattle = false;
 
 function isSpraying() {
   return isPinching || isTouching;
@@ -76,6 +98,12 @@ function isSpraying() {
 const handTracker = new HandTracker({
   onPinchChange: (pinching) => {
     isPinching = pinching;
+  },
+  onHandDetected: () => {
+    soundManager.playRattle();
+  },
+  onShake: () => {
+    soundManager.playRattle();
   },
 });
 
@@ -86,6 +114,7 @@ const arSession = new ArSession({
     startScreen.style.display = "none";
     xrOverlay.classList.add("active");
     xrStatus.textContent = "Move phone to find a surface";
+    if (heldCanGroup) heldCanGroup.visible = true;
   },
   onSessionEnd: () => {
     handTracker.stop();
@@ -93,7 +122,10 @@ const arSession = new ArSession({
     isPinching = false;
     isTouching = false;
     wasSpraying = false;
+    handTrackingAvailable = false;
+    hasPlayedFallbackRattle = false;
     reticle.visible = false;
+    if (heldCanGroup) heldCanGroup.visible = false;
 
     startScreen.style.display = "flex";
     xrOverlay.classList.remove("active");
@@ -125,8 +157,10 @@ arButton.addEventListener("click", async () => {
 
   try {
     await handTracker.start();
+    handTrackingAvailable = true;
   } catch (err) {
     console.warn("Hand-tracking camera unavailable, using tap-to-spray", err);
+    handTrackingAvailable = false;
   }
 
   if (previewGroup) scene.remove(previewGroup);
@@ -159,7 +193,14 @@ function animate(_time, frame) {
 
     const spraying = isSpraying() && !!arSession.latestHit;
     if (spraying && !wasSpraying) {
-      soundManager.playRattle();
+      // Hand-tracked sessions cue the rattle off picking up the can /
+      // shaking it (see handTracker's onHandDetected/onShake); only the
+      // touch-only fallback (no camera) has no such signal, so give it
+      // a one-time rattle on its very first spray instead.
+      if (!handTrackingAvailable && !hasPlayedFallbackRattle) {
+        soundManager.playRattle();
+        hasPlayedFallbackRattle = true;
+      }
       soundManager.startHiss();
     } else if (!spraying && wasSpraying) {
       soundManager.stopHiss();
@@ -167,6 +208,15 @@ function animate(_time, frame) {
     wasSpraying = spraying;
 
     spraySystem.update(dt, arSession.latestHit, spraying);
+
+    if (heldCanGroup) {
+      const targetTilt = spraying ? -0.3 : 0;
+      heldCanGroup.rotation.x = THREE.MathUtils.lerp(
+        heldCanGroup.rotation.x,
+        targetTilt,
+        0.2,
+      );
+    }
 
     xrStatus.textContent = !arSession.latestHit
       ? "Move phone to find a surface"
@@ -191,15 +241,13 @@ async function loadEnvironmentMap() {
   pmremGenerator.dispose();
 }
 
-async function loadCanPreview() {
+// Loads spray_can.glb and normalizes it to a unit-scale, origin-centered
+// model regardless of the source file's authoring units, so callers can
+// derive their own scale/placement from a known, predictable size.
+async function loadNormalizedCanModel() {
   const gltf = await new GLTFLoader().loadAsync("/models/spray_can.glb");
   const model = gltf.scene;
 
-  // Normalize to a unit-scale model regardless of the source file's
-  // authoring units, then derive camera distance from its bounding
-  // sphere and the camera's actual FOV rather than a hand-picked
-  // world-space size/distance pair - that stays correct no matter what
-  // the model's real-world unit scale turns out to be.
   const box = new THREE.Box3().setFromObject(model);
   const size = box.getSize(new THREE.Vector3());
   const maxDim = Math.max(size.x, size.y, size.z) || 1;
@@ -212,6 +260,16 @@ async function loadCanPreview() {
   const sphere = box.getBoundingSphere(new THREE.Sphere());
   const radius = sphere.radius * scale;
 
+  return { model, radius };
+}
+
+async function loadCanPreview() {
+  const { model, radius } = await loadNormalizedCanModel();
+
+  // Derive camera distance from the bounding sphere and the camera's
+  // actual FOV rather than a hand-picked world-space size/distance pair
+  // - that stays correct no matter what the model's real-world unit
+  // scale turns out to be.
   const targetFraction = 0.28; // fraction of half-height the can should occupy
   const fovRad = THREE.MathUtils.degToRad(camera.fov / 2);
   const distance = radius / (targetFraction * Math.tan(fovRad));
@@ -224,6 +282,22 @@ async function loadCanPreview() {
   scene.add(previewGroup);
 }
 
+async function loadHeldCan() {
+  const { model, radius } = await loadNormalizedCanModel();
+
+  // Small HUD-style prop in the lower-right of view, like a
+  // first-person held object, scaled to a fixed apparent size.
+  const targetRadius = 0.045;
+  model.scale.multiplyScalar(targetRadius / radius);
+
+  heldCanGroup = new THREE.Group();
+  heldCanGroup.add(model);
+  heldCanGroup.position.set(0.13, -0.14, -0.3);
+  heldCanGroup.rotation.set(0, Math.PI * 0.15, Math.PI * 0.08);
+  heldCanGroup.visible = false;
+  camera.add(heldCanGroup);
+}
+
 (async () => {
   const supported = await ArSession.isSupported();
 
@@ -231,6 +305,7 @@ async function loadCanPreview() {
     spraySystem.loadAssets(),
     loadEnvironmentMap(),
     loadCanPreview(),
+    loadHeldCan(),
   ]);
 
   if (!supported) {
