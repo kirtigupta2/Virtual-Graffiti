@@ -16,17 +16,33 @@ const xrExitButton = document.getElementById("xr-exit");
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.xr.enabled = true;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(
-  70,
-  window.innerWidth / window.innerHeight,
-  0.01,
-  20,
-);
+const camera = new THREE.PerspectiveCamera(70, 1, 0.01, 20);
+
+// Mobile Chrome can report a 0 or stale window.innerHeight on the very
+// first synchronous tick (before the dynamic toolbar/layout settles),
+// which would otherwise poison the projection matrix with a garbage
+// aspect ratio, so fall back to documentElement's size and re-apply on
+// the next frame in case layout was still settling at first call.
+function currentViewportSize() {
+  const w = window.innerWidth || document.documentElement.clientWidth || 1;
+  const h = window.innerHeight || document.documentElement.clientHeight || 1;
+  return { w, h };
+}
+
+function applyViewportSize() {
+  const { w, h } = currentViewportSize();
+  if (!w || !h) return;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+}
+
+applyViewportSize();
+requestAnimationFrame(applyViewportSize);
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.2));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -42,11 +58,9 @@ scene.add(reticle);
 
 let previewGroup = null;
 
-window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+window.addEventListener("resize", applyViewportSize);
+window.addEventListener("orientationchange", applyViewportSize);
+window.visualViewport?.addEventListener("resize", applyViewportSize);
 
 const spraySystem = new SpraySystem({ scene });
 const soundManager = new SoundManager();
@@ -181,18 +195,32 @@ async function loadCanPreview() {
   const gltf = await new GLTFLoader().loadAsync("/models/spray_can.glb");
   const model = gltf.scene;
 
+  // Normalize to a unit-scale model regardless of the source file's
+  // authoring units, then derive camera distance from its bounding
+  // sphere and the camera's actual FOV rather than a hand-picked
+  // world-space size/distance pair - that stays correct no matter what
+  // the model's real-world unit scale turns out to be.
   const box = new THREE.Box3().setFromObject(model);
   const size = box.getSize(new THREE.Vector3());
   const maxDim = Math.max(size.x, size.y, size.z) || 1;
-  const scale = 0.22 / maxDim;
+  const scale = 1 / maxDim;
   model.scale.setScalar(scale);
 
   const center = box.getCenter(new THREE.Vector3()).multiplyScalar(scale);
   model.position.sub(center);
 
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const radius = sphere.radius * scale;
+
+  const targetFraction = 0.28; // fraction of half-height the can should occupy
+  const fovRad = THREE.MathUtils.degToRad(camera.fov / 2);
+  const distance = radius / (targetFraction * Math.tan(fovRad));
+  const halfHeightAtDistance = distance * Math.tan(fovRad);
+  const verticalOffset = -0.45 * halfHeightAtDistance;
+
   previewGroup = new THREE.Group();
   previewGroup.add(model);
-  previewGroup.position.set(0, -0.55, -1.4);
+  previewGroup.position.set(0, verticalOffset, -distance);
   scene.add(previewGroup);
 }
 
